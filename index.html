@@ -30,11 +30,60 @@
 <div class="app"><main class="phone" id="app"></main></div>
 <div class="toast" id="toast"></div>
 <script>
-const KEY='biashara-smart-v1';
-const defaultState={user:null,business:{name:'',owner:'',location:''},transactions:[],screen:'home'};
-let state=load();
-function load(){try{return {...defaultState,...JSON.parse(localStorage.getItem(KEY)||'{}')}}catch(e){return {...defaultState}}}
-function save(){localStorage.setItem(KEY,JSON.stringify(state))}
+const SUPABASE_URL='https://opnqkbkkafjwafmxopeu.supabase.co';
+const SUPABASE_KEY='sb_publishable_VMux55sUteb_tf4juWLz0Q_YXKzhGjv';
+const SESSION_KEY='biashara-smart-supabase-session';
+const defaultState={user:null,business:{id:null,name:'',owner:'',location:''},transactions:[],screen:'home'};
+let state={...defaultState,business:{...defaultState.business},transactions:[]};
+let session=null;
+function save(){/* Business records are stored in Supabase; do not save auth secrets here. */}
+function readSession(){try{return JSON.parse(localStorage.getItem(SESSION_KEY)||'null')}catch(e){return null}}
+function storeSession(s){session=s;if(s)localStorage.setItem(SESSION_KEY,JSON.stringify(s));else localStorage.removeItem(SESSION_KEY)}
+async function authRequest(path,body){
+ const r=await fetch(SUPABASE_URL+'/auth/v1/'+path,{method:'POST',headers:{'Content-Type':'application/json','apikey':SUPABASE_KEY},body:JSON.stringify(body)});
+ const data=await r.json().catch(()=>({}));
+ if(!r.ok)throw new Error(data.msg||data.message||data.error_description||data.error||'Authentication failed');
+ return data;
+}
+async function dbRequest(path,options={}){
+ if(!session?.access_token)throw new Error('Please log in again to continue.');
+ const headers={'apikey':SUPABASE_KEY,'Authorization':'Bearer '+session.access_token,'Content-Type':'application/json',...(options.headers||{})};
+ const r=await fetch(SUPABASE_URL+'/rest/v1/'+path,{...options,headers});
+ const raw=await r.text();let data=null;try{data=raw?JSON.parse(raw):null}catch(e){data=raw}
+ if(!r.ok)throw new Error(data?.message||data?.hint||data?.details||'Database request failed ('+r.status+')');
+ return data;
+}
+function showError(e){console.error(e);toast(e?.message||'Something went wrong. Please try again.')}
+function mapTransaction(x){return {id:x.id,type:x.transaction_type,amount:Number(x.amount),category:x.category||'',customer:x.customer_name||'',description:x.description||'',date:x.transaction_date}}
+async function loadCloudData(){
+ const uid=session.user.id;
+ const businesses=await dbRequest('businesses?select=*&user_id=eq.'+encodeURIComponent(uid)+'&order=created_at.asc');
+ if(!businesses?.length){
+   const bizName=prompt('What is your business name?');
+   if(!bizName){state.user=null;render();return}
+   const owner=session.user.user_metadata?.full_name||session.user.email||'Business owner';
+   const created=await dbRequest('businesses',{method:'POST',headers:{'Prefer':'return=representation'},body:JSON.stringify({user_id:uid,business_name:bizName, business_type:null,location:'Kenya'})});
+   const b=Array.isArray(created)?created[0]:created;
+   state.business={id:b.id,name:b.business_name,owner,location:b.location||'Kenya'};
+ }else{
+   const b=businesses[0];
+   state.business={id:b.id,name:b.business_name,owner:session.user.user_metadata?.full_name||session.user.email||'Business owner',location:b.location||'Kenya'};
+ }
+ const rows=await dbRequest('transactions?select=*&business_id=eq.'+encodeURIComponent(state.business.id)+'&order=transaction_date.desc,created_at.desc');
+ state.transactions=(rows||[]).map(mapTransaction);
+ state.user={id:session.user.id,email:session.user.email,name:session.user.user_metadata?.full_name||session.user.email};
+ state.screen='home';render();
+}
+async function createCloudTransaction(type,amount,category='',customer='',description=''){
+ if(!session?.user?.id||!state.business.id)throw new Error('Your business profile is not ready. Please log in again.');
+ const result=await dbRequest('transactions',{method:'POST',headers:{'Prefer':'return=representation'},body:JSON.stringify({
+  user_id:session.user.id,business_id:state.business.id,transaction_type:type,amount:Number(amount),
+  category:category||null,customer_name:customer||null,description:description||null,
+  transaction_date:new Date().toISOString().slice(0,10)
+ })});
+ const row=Array.isArray(result)?result[0]:result;
+ if(row)state.transactions.unshift(mapTransaction(row));
+}
 const money=n=>'KSh '+Number(n||0).toLocaleString('en-KE',{maximumFractionDigits:0});
 const today=()=>new Date().toISOString().slice(0,10);
 function tx(type,amount,category=''){return {id:crypto.randomUUID?crypto.randomUUID():Date.now()+Math.random(),type,amount:Number(amount),category,date:today()}}
@@ -49,9 +98,39 @@ function render(){
  const views={home:home,record:record,moneyout:moneyout,moneyin:moneyin,credit:credit,withdraw:withdraw,business:business,reports:reports,monthly:monthly,health:health};
  app.innerHTML=(views[state.screen]||home)();
 }
-function login(){return `<div class="screen auth">${logo()}<div class="brand">BIASHARA <span>SMART</span></div><p class="tag">Your business, made simple.</p><div class="hero"><h2>Build a clearer business.</h2><p>Track your money without accounting language.</p></div><div class="field"><label>Phone number (M-Pesa)</label><input id="phone" placeholder="07XX XXX XXX"></div><div class="field"><label>Password</label><input id="pass" type="password" placeholder="••••••••"></div><button class="btn primary" onclick="loginNow()">Log In</button><div class="divider">or</div><button class="btn secondary" onclick="signup()">Create an account</button><p class="small" style="text-align:center;margin-top:18px">Version 1 • Your data stays on this device for now.</p></div>`}
-function loginNow(){if(!document.getElementById('phone').value){toast('Enter your phone number');return} state.user={phone:document.getElementById('phone').value};state.business={name:'Mama Beatrice Shop',owner:'Mama Beatrice',location:'Nairobi'};save();render()}
-function signup(){let name=prompt('Your name');if(!name)return;let biz=prompt('Business name');if(!biz)return;state.user={phone:'',name};state.business={name:biz,owner:name,location:'Kenya'};save();render()}
+function login(){return `<div class="screen auth">${logo()}<div class="brand">BIASHARA <span>SMART</span></div><p class="tag">Your business, made simple.</p><div class="hero"><h2>Build a clearer business.</h2><p>Track your money without accounting language.</p></div><div class="field"><label>Email address</label><input id="email" type="email" autocomplete="email" placeholder="you@example.com"></div><div class="field"><label>Password</label><input id="pass" type="password" autocomplete="current-password" placeholder="At least 6 characters"></div><button class="btn primary" onclick="loginNow()">Log In</button><div class="divider">or</div><button class="btn secondary" onclick="signup()">Create an account</button><p class="small" style="text-align:center;margin-top:18px">Your business records are stored in your Supabase project.</p></div>`}
+async function loginNow(){
+ const email=document.getElementById('email').value.trim();
+ const password=document.getElementById('pass').value;
+ if(!email||!password){toast('Enter your email and password');return}
+ try{
+  const data=await authRequest('token?grant_type=password',{email,password});
+  storeSession(data);await loadCloudData();toast('Logged in successfully');
+ }catch(e){showError(e)}
+}
+async function signup(){
+ const email=document.getElementById('email').value.trim();
+ const password=document.getElementById('pass').value;
+ if(!email||!password){toast('Enter your email and password first');return}
+ if(password.length<6){toast('Use a password with at least 6 characters');return}
+ const name=prompt('Your name');
+ if(!name)return;
+ const biz=prompt('Business name');
+ if(!biz)return;
+ try{
+  const data=await authRequest('signup',{email,password,data:{full_name:name}});
+  if(!data.access_token||!data.user){
+   toast('Account created. Check your email to confirm it, then log in.');
+   return;
+  }
+  storeSession(data);
+  const created=await dbRequest('businesses',{method:'POST',headers:{'Prefer':'return=representation'},body:JSON.stringify({user_id:data.user.id,business_name:biz,business_type:null,location:'Kenya'})});
+  const b=Array.isArray(created)?created[0]:created;
+  state.business={id:b.id,name:b.business_name,owner:name,location:b.location||'Kenya'};
+  state.user={id:data.user.id,email:data.user.email,name};
+  state.transactions=[];state.screen='home';render();toast('Account created');
+ }catch(e){showError(e)}
+}
 function header(title,back=true){return `<div class="topbar">${back?`<button class="back" onclick="backHome()">‹</button>`:'<span></span>'}<h1>${title}</h1><span></span></div>`}
 function backHome(){state.screen='home';save();render()}
 function home(){const t=totals();let n=state.business.owner||'Business owner';return shell(`<div class="greeting"><div><h2>Good evening,<br>${esc(n)} 👋</h2><p>Let's see how your business did today.</p></div><div class="avatar">${esc(n[0]||'B')}</div></div><div class="section-title">Today's Summary</div><div class="cards"><div class="stat in"><div class="label">Money In</div><div class="value">${money(t.inc)}</div></div><div class="stat out"><div class="label">Money Out</div><div class="value">${money(t.out)}</div></div><div class="stat home"><div class="label">Taken Home</div><div class="value">${money(t.home)}</div></div><div class="stat profit"><div class="label">Estimated Profit</div><div class="value">${money(t.profit)}</div></div></div><div class="record"><button class="btn primary" onclick="go('record')">＋ Record Money</button></div><div class="section-title">Your business this month</div><div class="summary"><div class="row"><span>Sales</span><strong>${money(t.inc)}</strong></div><div class="row"><span>Expenses</span><strong>${money(t.out)}</strong></div><div class="row"><span>Profit</span><strong>${money(t.profit)}</strong></div></div><div class="health"><div class="check">✓</div><p><strong>${t.profit>=0?'Your business is doing well!':'Let’s improve this together.'}</strong>${t.profit>=0?'Your records are up to date.':'Record more sales and expenses to see a clearer picture.'}</p></div>`, 'home')}
@@ -60,14 +139,14 @@ function moneyout(){return shell(`${header('I spent money')}<p class="small">How
 function categories(list){return list.map((x,i)=>`<div class="cat" onclick="pickCat(this,'${x}')"><span class="catico">${['▣','▰','⌂','♙','▤','▯','•'][i]}</span><span>${x}</span><span class="checkmark"></span></div>`).join('')}
 function pickCat(el,x){document.querySelectorAll('.cat').forEach(c=>{c.classList.remove('selected');c.querySelector('.checkmark').textContent=''});el.classList.add('selected');el.querySelector('.checkmark').textContent='✓';el.dataset.value=x}
 function selectedCat(){return document.querySelector('.cat.selected')?.dataset.value||'Other'}
-function addExpense(){let a=Number(document.getElementById('amt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}state.transactions.push(tx('expense',a,selectedCat()));save();toast('Expense saved');go('home')}
+async function addExpense(){let a=Number(document.getElementById('amt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}try{await createCloudTransaction('expense',a,selectedCat());toast('Expense saved to your account');go('home')}catch(e){showError(e)}}
 function moneyin(){return shell(`${header('I received money')}<p class="small">What kind of income was it?</p><button class="choice green" onclick="selectIncome(this,'Sales')"><span class="icoBox">▣</span><span><strong>Sales</strong><span>Cash, M-Pesa, Card</span></span><b class="arrow">›</b></button><button class="choice" onclick="selectIncome(this,'Credit received')"><span class="icoBox">▣</span><span><strong>Credit received</strong><span>Money from customers</span></span><b class="arrow">›</b></button><button class="choice" onclick="selectIncome(this,'Other income')"><span class="icoBox">◉</span><span><strong>Other income</strong><span>Side income, refunds, etc.</span></span><b class="arrow">›</b></button><div class="section-title">Amount</div><div class="amount"><input id="inamt" inputmode="numeric" placeholder="KSh 0"></div><button class="btn primary" onclick="addIncome()">Done ✓</button>`, 'money')}
 function selectIncome(el,x){document.querySelectorAll('.choice').forEach(c=>c.style.outline='none');el.style.outline='2px solid #58a784';el.dataset.value=x}
-function addIncome(){let a=Number(document.getElementById('inamt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}let c=document.querySelector('.choice[style*="outline"]')?.dataset.value||'Sales';state.transactions.push(tx('income',a,c));save();toast('Money in saved');go('home')}
+async function addIncome(){let a=Number(document.getElementById('inamt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}let c=document.querySelector('.choice[style*="outline"]')?.dataset.value||'Sales';try{await createCloudTransaction('income',a,c);toast('Money in saved to your account');go('home')}catch(e){showError(e)}}
 function credit(){return shell(`${header('Someone owes me')}<p class="small">Record a sale you expect to receive later.</p><div class="field"><label>Customer name</label><input id="cust" placeholder="e.g. Brian"></div><div class="amount"><input id="camt" inputmode="numeric" placeholder="KSh 0"></div><div class="field"><label>What was sold?</label><input id="cdesc" placeholder="e.g. 2 bags of rice"></div><button class="btn primary" onclick="addCredit()">Save credit</button>`, 'money')}
-function addCredit(){let a=Number(document.getElementById('camt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}state.transactions.push({...tx('credit_given',a,'Credit sale'),customer:document.getElementById('cust').value,description:document.getElementById('cdesc').value});save();toast('Customer credit saved');go('home')}
+async function addCredit(){let a=Number(document.getElementById('camt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}try{await createCloudTransaction('credit_given',a,'Credit sale',document.getElementById('cust').value,document.getElementById('cdesc').value);toast('Customer credit saved to your account');go('home')}catch(e){showError(e)}}
 function withdraw(){return shell(`${header('I took money home')}<p class="small">How much did you take from the business for personal use?</p><div class="amount"><input id="wamt" inputmode="numeric" placeholder="KSh 0"></div><button class="btn primary" onclick="addWithdraw()">Done ✓</button>`, 'money')}
-function addWithdraw(){let a=Number(document.getElementById('wamt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}state.transactions.push(tx('owner_withdrawal',a,'Taken Home'));save();toast('Withdrawal saved');go('home')}
+async function addWithdraw(){let a=Number(document.getElementById('wamt').value.replace(/[^0-9.]/g,''));if(!a){toast('Enter an amount');return}try{await createCloudTransaction('owner_withdrawal',a,'Taken Home');toast('Withdrawal saved to your account');go('home')}catch(e){showError(e)}}
 function business(){const t=totals();return shell(`${header('My Business',false)}<div class="tabs"><button class="tab active">Today</button><button class="tab">This Week</button><button class="tab">This Month</button></div><div class="metricRow"><div class="metric"><span>Sales</span><strong>${money(t.inc)}</strong></div><div class="metric"><span>Expenses</span><strong>${money(t.out)}</strong></div></div><div class="metric" style="margin-top:9px;background:#fff7dc"><span>Estimated Profit</span><strong>${money(t.profit)}</strong></div><div class="section-title">Top Expenses</div>${expenseBars()}<div class="section-title">Business Profile</div><div class="summary"><div class="row"><span>Name</span><strong>${esc(state.business.name)}</strong></div><div class="row"><span>Owner</span><strong>${esc(state.business.owner)}</strong></div><div class="row"><span>Location</span><strong>${esc(state.business.location)}</strong></div></div>`, 'business')}
 function expenseBars(){let t={};state.transactions.filter(x=>x.type==='expense').forEach(x=>t[x.category]=(t[x.category]||0)+x.amount);let total=Object.values(t).reduce((a,b)=>a+b,0)||1;return Object.entries(t).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<div class="barRow"><span>${esc(k)}</span><div class="bar"><i style="width:${Math.round(v/total*100)}%"></i></div><b>${Math.round(v/total*100)}%</b></div>`).join('')||'<p class="small">Your expense breakdown will appear here as you record money out.</p>'}
 function monthly(){const t=totals();return shell(`${header('Monthly Report')}<div class="reportHero"><small>September 2026</small><div class="big">Total Sales ${money(t.inc)}</div><small>↑ Your sales and records are being tracked.</small></div><div class="reportStats"><div class="metric"><span>Total Expenses</span><strong>${money(t.out)}</strong></div><div class="metric"><span>Estimated Profit</span><strong>${money(t.profit)}</strong></div></div><div class="section-title">Sales & Expenses Trend</div><div class="chart"><svg viewBox="0 0 330 120" preserveAspectRatio="none"><polyline points="0,98 35,80 70,88 105,58 140,72 175,48 210,62 245,43 280,51 330,22" fill="none" stroke="#08765e" stroke-width="3"/><polyline points="0,108 35,98 70,103 105,82 140,90 175,73 210,86 245,72 280,78 330,61" fill="none" stroke="#e4ad25" stroke-width="3"/><line x1="0" y1="108" x2="330" y2="108" stroke="#d9ddd8"/></svg></div><div class="tip"><b>💡 Business Tip</b><br>Keep recording every sale and expense. The more complete your records, the more useful your business report becomes.</div>`, 'reports')}
@@ -78,7 +157,14 @@ function exportCSV(){let rows=[['Date','Type','Category','Amount','Customer','De
 function downloadBlob(text,name,type){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click();URL.revokeObjectURL(a.href)}
 function go(s){state.screen=s;save();render();window.scrollTo(0,0)}
 function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
-render();
+async function startApp(){
+ session=readSession();
+ if(session?.access_token&&session?.user){
+  try{await loadCloudData();return}catch(e){console.warn('Could not restore Supabase session',e);storeSession(null)}
+ }
+ render();
+}
+startApp();
 if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}))}
 </script>
 </body>
